@@ -1,45 +1,470 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  scaffold
+  Serverless To-Do application with event-driven expiry processing.
+  Phase 1 - Cognito authentication, SNS notifications topic, DynamoDB table.
+  Phase 2 - REST API (API Gateway + Cognito authorizer) with task CRUD Lambdas.
+  Phase 3 - Expiry: one-time EventBridge Scheduler schedule per task -> ExpireTask Lambda
+            -> DynamoDB (Pending -> Expired) + SNS email to the task owner.
 
-  Sample SAM Template for scaffold
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: Deployment stage, used in resource names.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: How long CloudWatch keeps Lambda logs.
+  DefaultDeadlineMinutes:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Minutes after creation before a Pending task expires (when the client does not send one).
 
-# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
 Globals:
   Function:
-    Timeout: 3
-
-    # You can add LoggingConfig parameters such as the Logformat, Log Group, and SystemLogLevel or ApplicationLogLevel. Learn more here https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-function.html#sam-function-loggingconfig.
+    Runtime: python3.12
+    Architectures: [x86_64]
+    MemorySize: 256
+    Timeout: 10
+    Tracing: Active
+    # Powertools comes from the AWS-managed Lambda layer (pinned version) instead of pip:
+    # smaller packages, faster builds, and no Windows long-path build errors.
+    Layers:
+      - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python312-x86_64:38
     LoggingConfig:
       LogFormat: JSON
+      ApplicationLogLevel: INFO
+      SystemLogLevel: WARN
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+        TABLE_NAME: !Ref TodoTable
+        POWERTOOLS_SERVICE_NAME: todo-app
+        POWERTOOLS_METRICS_NAMESPACE: TodoApp
+
 Resources:
-  HelloWorldFunction:
-    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+  # ---------------------------------------------------------------------------
+  # Data
+  # ---------------------------------------------------------------------------
+  TodoTable:
+    Type: AWS::DynamoDB::Table
     Properties:
-      CodeUri: hello_world/
-      Handler: app.lambda_handler
-      Runtime: python3.12
-      Architectures:
-      - x86_64
+      TableName: !Sub todo-${Stage}-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: GSI1PK, AttributeType: S }
+        - { AttributeName: GSI1SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: GSI1PK, KeyType: HASH }
+            - { AttributeName: GSI1SK, KeyType: RANGE }
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # Notifications
+  # ---------------------------------------------------------------------------
+  TaskNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub todo-${Stage}-task-notifications
+      DisplayName: To-Do Alerts
+
+  # ---------------------------------------------------------------------------
+  # Authentication
+  # ---------------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub todo-${Stage}-users
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      # No Schema block: email is already required because it is the username
+      # attribute, and a Schema with a required standard attribute makes every
+      # later stack update fail ("Required custom attributes are not supported").
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - { Name: verified_email, Priority: 1 }
+      # LambdaConfig (PreSignUp / PostAuthentication) is added by SAM from the
+      # Cognito events on the functions below.
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub todo-${Stage}-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH        # used by the Amplify frontend
+        - ALLOW_USER_PASSWORD_AUTH   # used for CLI testing
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  PreSignUpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub todo-${Stage}-pre-signup
+      Description: Auto-confirms new users and marks their email as verified.
+      CodeUri: src/auth/
+      Handler: pre_signup.handler
+      Timeout: 5
       Events:
-        HelloWorld:
-          Type: Api # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
+        CognitoPreSignUp:
+          Type: Cognito
           Properties:
-            Path: /hello
+            UserPool: !Ref UserPool
+            Trigger: PreSignUp
+
+  PreSignUpLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/todo-${Stage}-pre-signup
+      RetentionInDays: !Ref LogRetentionDays
+
+  PostAuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub todo-${Stage}-post-auth
+      Description: Subscribes the user's email to the task notifications topic (filtered by userId).
+      CodeUri: src/auth/
+      Handler: post_auth.handler
+      Timeout: 5
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TodoTable
+          TOPIC_ARN: !Ref TaskNotificationsTopic
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: SubscribeUserEmail
+              Effect: Allow
+              Action: sns:Subscribe
+              Resource: !Ref TaskNotificationsTopic
+            - Sid: CheckSubscriptionState
+              Effect: Allow
+              Action: sns:GetSubscriptionAttributes
+              Resource: !Sub ${TaskNotificationsTopic}:*
+            - Sid: UserProfileItem
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+              Resource: !GetAtt TodoTable.Arn
+      Events:
+        CognitoPostAuth:
+          Type: Cognito
+          Properties:
+            UserPool: !Ref UserPool
+            Trigger: PostAuthentication
+
+  PostAuthLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/todo-${Stage}-post-auth
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------------------------------------------------------------------
+  # Tasks REST API  (API Gateway -> Lambda -> DynamoDB)
+  # ---------------------------------------------------------------------------
+  TodoApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub todo-${Stage}-api
+      StageName: !Ref Stage
+      OpenApiVersion: '3.0.1'      # stops SAM creating an extra "Stage" stage
+      TracingEnabled: true
+      Cors:
+        AllowOrigin: "'*'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false   # browsers send OPTIONS without a token
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+      GatewayResponses:
+        # CORS headers on API Gateway's own errors (401 from the authorizer, 403, 5xx),
+        # otherwise the browser reports them as CORS failures.
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 20
+
+  CreateTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub todo-${Stage}-create-task
+      Description: POST /tasks - creates a Pending task with a deadline.
+      CodeUri: src/tasks/
+      Handler: create_task.handler
+      Environment:
+        Variables:
+          DEFAULT_DEADLINE_MINUTES: !Ref DefaultDeadlineMinutes
+          SCHEDULE_GROUP: !Ref ExpiryScheduleGroup
+          EXPIRE_FUNCTION_ARN: !GetAtt ExpireTaskFunction.Arn
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerInvokeRole.Arn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt TodoTable.Arn
+            - Sid: ManageExpirySchedules   # create, and delete again if the DynamoDB write fails
+              Effect: Allow
+              Action:
+                - scheduler:CreateSchedule
+                - scheduler:DeleteSchedule
+              Resource: !Sub arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ExpiryScheduleGroup}/*
+            - Sid: PassSchedulerRole
+              Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt SchedulerInvokeRole.Arn
+              Condition:
+                StringEquals:
+                  iam:PassedToService: scheduler.amazonaws.com
+      Events:
+        CreateTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /tasks
+            Method: post
+
+  ListTasksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub todo-${Stage}-list-tasks
+      Description: GET /tasks[?status=Pending|Completed|Expired] - lists the caller's tasks.
+      CodeUri: src/tasks/
+      Handler: list_tasks.handler
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource:
+                - !GetAtt TodoTable.Arn
+                - !Sub ${TodoTable.Arn}/index/GSI1
+      Events:
+        ListTasks:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /tasks
             Method: get
 
+  GetTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub todo-${Stage}-get-task
+      Description: GET /tasks/{taskId} - returns one of the caller's tasks.
+      CodeUri: src/tasks/
+      Handler: get_task.handler
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt TodoTable.Arn
+      Events:
+        GetTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /tasks/{taskId}
+            Method: get
+
+  UpdateTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub todo-${Stage}-update-task
+      Description: PUT /tasks/{taskId} - edits a Pending task or marks it Completed.
+      CodeUri: src/tasks/
+      Handler: update_task.handler
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt TodoTable.Arn
+      Events:
+        UpdateTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /tasks/{taskId}
+            Method: put
+
+  DeleteTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub todo-${Stage}-delete-task
+      Description: DELETE /tasks/{taskId} - deletes one of the caller's tasks.
+      CodeUri: src/tasks/
+      Handler: delete_task.handler
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:DeleteItem
+              Resource: !GetAtt TodoTable.Arn
+      Events:
+        DeleteTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /tasks/{taskId}
+            Method: delete
+
+  CreateTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/todo-${Stage}-create-task
+      RetentionInDays: !Ref LogRetentionDays
+
+  ListTasksLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/todo-${Stage}-list-tasks
+      RetentionInDays: !Ref LogRetentionDays
+
+  GetTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/todo-${Stage}-get-task
+      RetentionInDays: !Ref LogRetentionDays
+
+  UpdateTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/todo-${Stage}-update-task
+      RetentionInDays: !Ref LogRetentionDays
+
+  DeleteTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/todo-${Stage}-delete-task
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------------------------------------------------------------------
+  # Expiry  (EventBridge Scheduler -> ExpireTask Lambda -> DynamoDB + SNS)
+  # ---------------------------------------------------------------------------
+  ExpiryScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub todo-${Stage}-task-expiry
+
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lets EventBridge Scheduler invoke the ExpireTask Lambda (and nothing else).
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeExpireTask
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ExpireTaskFunction.Arn
+                  - !Sub ${ExpireTaskFunction.Arn}:*
+
+  ExpireTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub todo-${Stage}-expire-task
+      Description: Scheduler target - marks a Pending task Expired and emails the owner via SNS.
+      CodeUri: src/tasks/
+      Handler: expire_task.handler
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref TaskNotificationsTopic
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt TodoTable.Arn
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref TaskNotificationsTopic
+
+  ExpireTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/todo-${Stage}-expire-task
+      RetentionInDays: !Ref LogRetentionDays
+
 Outputs:
-  # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
-  # Find out more about other implicit resources you can reference within SAM
-  # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
-  HelloWorldApi:
-    Description: API Gateway endpoint URL for Prod stage for Hello World 
-      function
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/hello/"
-  HelloWorldFunction:
-    Description: Hello World Lambda Function ARN
-    Value: !GetAtt HelloWorldFunction.Arn
-  HelloWorldFunctionIamRole:
-    Description: Implicit IAM Role created for Hello World function
-    Value: !GetAtt HelloWorldFunctionRole.Arn
+  Region:
+    Value: !Ref AWS::Region
+  ApiUrl:
+    Description: Tasks REST API base URL (frontend VITE_API_URL)
+    Value: !Sub https://${TodoApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  UserPoolId:
+    Description: Cognito User Pool ID (frontend VITE_USER_POOL_ID)
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Cognito App Client ID (frontend VITE_USER_POOL_CLIENT_ID)
+    Value: !Ref UserPoolClient
+  TaskNotificationsTopicArn:
+    Value: !Ref TaskNotificationsTopic
+  TodoTableName:
+    Value: !Ref TodoTable
+  TodoTableStreamArn:
+    Value: !GetAtt TodoTable.StreamArn
+  ExpiryScheduleGroupName:
+    Description: EventBridge Scheduler group holding one schedule per Pending task
+    Value: !Ref ExpiryScheduleGroup

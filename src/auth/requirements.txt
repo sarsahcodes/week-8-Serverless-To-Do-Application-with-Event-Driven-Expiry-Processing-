@@ -1,0 +1,2 @@
+# aws-lambda-powertools is provided by the Powertools Lambda layer (see Globals in template.yaml).
+# boto3 is included in the Lambda runtime.
