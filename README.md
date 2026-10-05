@@ -4,6 +4,14 @@ Backend for a serverless task manager built with AWS SAM. Users sign up with Cog
 
 See [docs/PLAN.md](docs/PLAN.md) for the full architecture and build plan. The frontend lives in a separate repo (`todo-frontend`).
 
+## Architecture
+
+![Architecture diagram](docs/architecture.png)
+
+Editable source: [`docs/architecture.drawio`](docs/architecture.drawio) (open in [diagrams.net](https://app.diagrams.net) or the draw.io desktop / VS Code extension). It is generated as code by [`docs/make_diagram.py`](docs/make_diagram.py) and has a second page with the DynamoDB single-table design ([PNG](docs/dynamodb-design.png)).
+
+**Stage-by-stage description of every numbered step:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+
 ## API
 
 All routes require a Cognito **ID token** in the `Authorization` header.
@@ -24,7 +32,7 @@ All routes require a Cognito **ID token** in the `Authorization` header.
 - [x] Phase 3 – Expiry (EventBridge Scheduler → Lambda → DynamoDB + SNS)
 - [ ] Phase 4 – Cancellation (Streams → SQS FIFO → Lambda)
 - [ ] Phase 5 – Observability and least privilege
-- [ ] Phase 6 – Amplify frontend
+- [x] Phase 6 – Amplify Hosting for the frontend (defined in SAM)
 - [ ] Phase 7 – SAM pipeline
 
 ## Layout

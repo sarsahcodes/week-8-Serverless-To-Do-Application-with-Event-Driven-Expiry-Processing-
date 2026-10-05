@@ -246,3 +246,4 @@ $RECYCLE.BIN/
 .aws-sam/
 samconfig.local.toml
 .pytest_cache/
+Claude outputs/

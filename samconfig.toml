@@ -14,6 +14,7 @@ parallel = true
 lint = true
 
 [default.deploy.parameters]
+parameter_overrides = "FrontendRepoUrl=https://github.com/sarsahcodes/todo-frontend"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 resolve_s3 = true

@@ -6,6 +6,7 @@ Description: >
   Phase 2 - REST API (API Gateway + Cognito authorizer) with task CRUD Lambdas.
   Phase 3 - Expiry: one-time EventBridge Scheduler schedule per task -> ExpireTask Lambda
             -> DynamoDB (Pending -> Expired) + SNS email to the task owner.
+  Phase 6 - Amplify Hosting for the React frontend (built from GitHub, env vars from this stack).
 
 Parameters:
   Stage:
@@ -17,11 +18,26 @@ Parameters:
     Type: Number
     Default: 14
     Description: How long CloudWatch keeps Lambda logs.
+  FrontendRepoUrl:
+    Type: String
+    Default: ''
+    Description: HTTPS URL of the frontend GitHub repo (e.g. https://github.com/<user>/todo-frontend). Empty = no Amplify app.
+  FrontendBranch:
+    Type: String
+    Default: main
+    Description: Branch Amplify builds and hosts.
+  GitHubTokenSecretName:
+    Type: String
+    Default: todo/github-token
+    Description: Secrets Manager secret holding a GitHub personal access token (classic, scopes repo + admin:repo_hook).
   DefaultDeadlineMinutes:
     Type: Number
     Default: 5
     MinValue: 1
     Description: Minutes after creation before a Pending task expires (when the client does not send one).
+
+Conditions:
+  HasFrontendRepo: !Not [!Equals [!Ref FrontendRepoUrl, '']]
 
 Globals:
   Function:
@@ -447,6 +463,62 @@ Resources:
       LogGroupName: !Sub /aws/lambda/todo-${Stage}-expire-task
       RetentionInDays: !Ref LogRetentionDays
 
+  # ---------------------------------------------------------------------------
+  # Frontend hosting  (AWS Amplify Hosting, built from the frontend GitHub repo)
+  # ---------------------------------------------------------------------------
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Condition: HasFrontendRepo
+    Properties:
+      Name: !Sub todo-${Stage}-frontend
+      Description: React + Vite frontend for the serverless To-Do app
+      Repository: !Ref FrontendRepoUrl
+      AccessToken: !Sub '{{resolve:secretsmanager:${GitHubTokenSecretName}}}'
+      Platform: WEB
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - nvm install 22
+                - node --version
+                - npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: dist
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - node_modules/**/*
+      # Backend values injected at build time -> read by src/amplifyConfig.js (Amplify.configure)
+      EnvironmentVariables:
+        - Name: VITE_AWS_REGION
+          Value: !Ref AWS::Region
+        - Name: VITE_USER_POOL_ID
+          Value: !Ref UserPool
+        - Name: VITE_USER_POOL_CLIENT_ID
+          Value: !Ref UserPoolClient
+        - Name: VITE_API_URL
+          Value: !Sub https://${TodoApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+      CustomRules:
+        # Single-page app: serve index.html for every route that is not a static file
+        - Source: '</^[^.]+$|\.(?!(css|gif|ico|jpg|jpeg|js|png|txt|svg|woff|woff2|ttf|map|json|webp)$)([^.]+$)/>'
+          Target: /index.html
+          Status: '200'
+
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Condition: HasFrontendRepo
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: !Ref FrontendBranch
+      Stage: PRODUCTION
+      EnableAutoBuild: true   # every push to the branch rebuilds and redeploys the site
+
 Outputs:
   Region:
     Value: !Ref AWS::Region
@@ -465,6 +537,14 @@ Outputs:
     Value: !Ref TodoTable
   TodoTableStreamArn:
     Value: !GetAtt TodoTable.StreamArn
+  AmplifyAppId:
+    Condition: HasFrontendRepo
+    Description: Amplify app id (for aws amplify start-job)
+    Value: !GetAtt AmplifyApp.AppId
+  AmplifyUrl:
+    Condition: HasFrontendRepo
+    Description: Public URL of the hosted frontend
+    Value: !Sub https://${FrontendBranch}.${AmplifyApp.DefaultDomain}
   ExpiryScheduleGroupName:
     Description: EventBridge Scheduler group holding one schedule per Pending task
     Value: !Ref ExpiryScheduleGroup
